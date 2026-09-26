@@ -106,6 +106,60 @@ def test_compensation_failure_then_resume(client):
     assert [v["current_opening"] for v in s2["valves"]] == [1, 2, 3, 4]
 
 
+def test_unfinished_operation_blocks_overlapping_switch(client):
+    """A switch stuck in COMPENSATION_FAILED keeps ownership of its valves:
+    a new operation_id naming them gets an explicit 409 and touches nothing;
+    disjoint valves still switch; once the old operation restores, the
+    blocked request goes through."""
+    c, _ = client
+    c.post("/api/test/failures",
+           json={"forward": ["V03"], "compensate": ["V02"]})
+    s = c.post("/api/switches", json=payload("op-old")).json()
+    assert s["phase"] == "COMPENSATION_FAILED"
+
+    blocked = {
+        "operation_id": "op-new",
+        "valves": [
+            {"valve_id": "V01", "initial_opening": 51, "target_opening": 71},
+            {"valve_id": "V02", "initial_opening": 52, "target_opening": 72},
+        ],
+    }
+    r = c.post("/api/switches", json=blocked)
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert "unfinished operation" in detail and "op-old" in detail
+    assert "no device was touched" in detail
+
+    # The conflict left no record and changed no field opening.
+    assert c.get("/api/switches/op-new").status_code == 404
+    assert c.get("/api/devices/executed-actions",
+                 params={"operation_id": "op-new"}).json() == []
+    cur = {v["valve_id"]: v["opening"]
+           for v in c.get("/api/devices/valves").json()}
+    assert cur["V01"] == 51 and cur["V02"] == 52
+
+    # A switch over disjoint valves still completes.
+    disjoint = {
+        "operation_id": "op-free",
+        "valves": [
+            {"valve_id": "V07", "initial_opening": 7, "target_opening": 57},
+            {"valve_id": "V08", "initial_opening": 8, "target_opening": 58},
+        ],
+    }
+    r = c.post("/api/switches", json=disjoint)
+    assert r.status_code == 201 and r.json()["phase"] == "COMPLETED"
+
+    # Fault cleared, old operation restored: the blocked request now goes.
+    c.post("/api/test/failures", json={"forward": [], "compensate": []})
+    s2 = c.post("/api/switches/op-old/resume").json()
+    assert s2["phase"] == "COMPENSATED"
+    r = c.post("/api/switches", json=blocked)
+    assert r.status_code == 201
+    s3 = r.json()
+    assert s3["phase"] == "COMPLETED"
+    assert [v["current_opening"] for v in s3["valves"]] == [71, 72]
+
+
 def test_validation_rejects_bad_count_and_opening(client):
     c, _ = client
     bad_count = payload("op-bad", n=2)

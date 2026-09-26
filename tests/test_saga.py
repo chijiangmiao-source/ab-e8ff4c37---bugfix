@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 
 from app.models import SwitchRequest, ValveSpec
-from app.saga import PayloadConflict
+from app.saga import PayloadConflict, ValveConflict
 
 from conftest import make_request
 
@@ -169,6 +169,119 @@ def test_device_rejects_are_persisted_and_safe_to_retry(engine):
     # While still broken, replay must not claim success.
     again, _ = eng.submit(make_request("op-rej", n=2))
     assert again.phase == "COMPENSATED"
+
+
+def _custom_request(op: str, specs) -> SwitchRequest:
+    return SwitchRequest(
+        operation_id=op,
+        valves=[
+            ValveSpec(valve_id=vid, initial_opening=init, target_opening=tgt)
+            for vid, init, tgt in specs
+        ],
+    )
+
+
+def test_unfinished_compensation_protects_shared_valves(engine):
+    """The reported contradiction: a switch stuck in COMPENSATION_FAILED
+    still owns its valves, so a new operation_id naming them must conflict
+    without touching anything — until the old operation fully restores."""
+    eng, store, devices, _ = engine
+    devices.set_failures(forward=["V03"], compensate=["V02"])
+    stuck = eng.submit(make_request("op-stuck", n=4))[0]
+    assert stuck.phase == "COMPENSATION_FAILED"
+    # V01/V02 are still sitting at the old operation's targets (V04 was
+    # never attempted, so the device bank has no row for it).
+    assert {v.valve_id: v.opening for v in devices.list_valves()} == {
+        "V01": 61, "V02": 62, "V03": 3,
+    }
+
+    # New operation id, field openings registered as initials, new targets.
+    blocked_req = _custom_request(
+        "op-blocked", [("V01", 61, 81), ("V02", 62, 82)]
+    )
+    with pytest.raises(ValveConflict) as excinfo:
+        eng.submit(blocked_req)
+    assert excinfo.value.blockers == {
+        "V01": ["op-stuck"], "V02": ["op-stuck"],
+    }
+
+    # Nothing was registered and no device was touched.
+    assert store.get("op-blocked") is None
+    assert devices.executed_actions("op-blocked") == []
+    assert {v.valve_id: v.opening for v in devices.list_valves()} == {
+        "V01": 61, "V02": 62, "V03": 3,
+    }
+
+    # A switch over disjoint valves is unaffected.
+    free = eng.submit(_custom_request(
+        "op-free", [("V07", 7, 77), ("V08", 8, 88)]
+    ))[0]
+    assert free.phase == "COMPLETED"
+
+    # Protection survives an engine restart while the old op is unfinished.
+    restarted = type(eng)(store, devices)
+    with pytest.raises(ValveConflict):
+        restarted.submit(blocked_req)
+
+    # Fault cleared: the old operation restores V02 then V01 (reverse order).
+    devices.set_failures(forward=[], compensate=[])
+    resumed = restarted.resume("op-stuck")
+    assert resumed.phase == "COMPENSATED"
+    assert {v.valve_id: v.opening for v in devices.list_valves()} == {
+        "V01": 1, "V02": 2, "V03": 3, "V07": 77, "V08": 88,
+    }
+
+    # The previously blocked request now submits and completes.
+    status, created = restarted.submit(blocked_req)
+    assert created and status.phase == "COMPLETED"
+    assert {v.valve_id: v.current_opening for v in status.valves} == {
+        "V01": 81, "V02": 82,
+    }
+    forward = [a for a in devices.executed_actions("op-blocked")
+               if a.phase == "FORWARD"]
+    assert [(a.valve_id, a.opening) for a in forward] == [
+        ("V01", 81), ("V02", 82),
+    ]
+
+
+def test_completed_operations_do_not_block_followup_switches(engine):
+    """Final operations release their valves: chaining switches over the
+    same valves is the normal flow and must keep working."""
+    eng, store, devices, _ = engine
+    assert eng.submit(make_request("op-one", n=3))[0].phase == "COMPLETED"
+
+    follow = _custom_request("op-two", [("V01", 61, 10), ("V02", 62, 20)])
+    status, created = eng.submit(follow)
+    assert created and status.phase == "COMPLETED"
+    assert {v.valve_id: v.current_opening for v in status.valves} == {
+        "V01": 10, "V02": 20,
+    }
+
+
+def test_pending_intent_also_protects_its_valves(engine):
+    """A crash right after intent registration leaves a PENDING operation;
+    its valves are still owned until the operation settles."""
+    eng, store, devices, _ = engine
+    from app.store import ActionRecord
+    req = make_request("op-mid", n=3)
+    store.create_intent(
+        "op-mid",
+        {"payload_key": "[]"},
+        [ActionRecord(valve_id=v.valve_id, idx=i,
+                      initial_opening=v.initial_opening,
+                      target_opening=v.target_opening)
+         for i, v in enumerate(req.valves)],
+    )
+
+    with pytest.raises(ValveConflict):
+        eng.submit(_custom_request("op-other", [("V02", 2, 90),
+                                                ("V09", 9, 99)]))
+    # The owner itself can still be resumed via its own operation id.
+    assert eng.resume("op-mid").phase == "COMPLETED"
+    # ... and only then is the other switch free to go.
+    assert eng.submit(_custom_request(
+        "op-other", [("V02", 62, 90), ("V09", 9, 99)]
+    ))[0].phase == "COMPLETED"
 
 
 @pytest.mark.parametrize("n", [1, 9])

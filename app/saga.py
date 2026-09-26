@@ -16,6 +16,12 @@ Rules implemented here:
 * Re-submitting an existing operation_id returns the same stored result; a
   re-submission with a different payload is rejected (409) and never touches
   a device.
+* An operation that has not reached a final phase keeps ownership of its
+  valves: a NEW operation_id naming any of those valves is rejected (409)
+  before anything is registered and before any device is touched.  Without
+  this, a follow-up switch could complete over valves that the unfinished
+  operation later restores to their initial openings, leaving the field
+  state, the stored phase and the per-valve results in contradiction.
 """
 from __future__ import annotations
 
@@ -33,6 +39,26 @@ FINAL_PHASES = {"COMPLETED", "COMPENSATED"}
 
 class PayloadConflict(Exception):
     """Same operation_id, different payload."""
+
+
+class ValveConflict(Exception):
+    """A new switch names valves still owned by an unfinished operation.
+
+    ``blockers`` maps each shared valve_id to the unfinished operation ids
+    that still own it (in registration order).
+    """
+
+    def __init__(self, operation_id: str,
+                 blockers: Dict[str, List[str]]) -> None:
+        self.operation_id = operation_id
+        self.blockers = blockers
+        shared = ", ".join(
+            f"{valve} <- {', '.join(ops)}"
+            for valve, ops in sorted(blockers.items())
+        )
+        super().__init__(
+            f"shared valve(s) still owned by unfinished operation(s): {shared}"
+        )
 
 
 class SagaEngine:
@@ -53,6 +79,18 @@ class SagaEngine:
                     raise PayloadConflict(req.operation_id)
                 # Same intent: run recovery/settlement, then return same result.
                 return self._resume_and_build(existing), False
+
+            # A new operation must not interleave with an unfinished one:
+            # reject before the intent is even registered, so no device is
+            # touched and no record of this operation_id exists.
+            protected = self._protected_valves()
+            shared = {
+                v.valve_id: protected[v.valve_id]
+                for v in req.valves
+                if v.valve_id in protected
+            }
+            if shared:
+                raise ValveConflict(req.operation_id, shared)
 
             actions = [
                 ActionRecord(
@@ -102,6 +140,25 @@ class SagaEngine:
         return recovered
 
     # ------------------------------------------------------------- machinery
+
+    def _protected_valves(self) -> Dict[str, List[str]]:
+        """Valves still owned by unfinished operations.
+
+        Until an operation reaches a final phase (COMPLETED / COMPENSATED)
+        it may still drive any of its valves — pending forward actions,
+        reverse-order compensation, or startup recovery — so every valve it
+        names stays protected.  Once the operation settles, its valves are
+        free for the next switch.
+        """
+        protected: Dict[str, List[str]] = {}
+        for rec in self._store.all():
+            if rec.phase in FINAL_PHASES:
+                continue
+            for a in rec.actions:
+                ops = protected.setdefault(a.valve_id, [])
+                if rec.operation_id not in ops:
+                    ops.append(rec.operation_id)
+        return protected
 
     @staticmethod
     def _canonical_payload(req: SwitchRequest) -> List[Dict]:

@@ -178,3 +178,97 @@ def test_crash_during_compensation_resumes_reverse_rollback(tmp_path):
             comp = [(a["valve_id"], a["opening"])
                     for a in acts if a["phase"] == "COMPENSATE"]
             assert comp == [("V02", 2), ("V01", 1)]  # reverse order, once each
+
+
+def test_compensation_failure_blocks_overlap_until_recovery_after_restart(
+        tmp_path, monkeypatch):
+    """The full reported chain over real server processes:
+
+    1. op-old stalls in COMPENSATION_FAILED (V03 rejects the forward action,
+       V02's restoration hits a network failure);
+    2. a new operation id naming the changed valves -> explicit 409, field
+       openings untouched, no record left behind;
+    3. a switch over disjoint valves still completes;
+    4. the fault is cleared and the service restarted (test hook exits the
+       process, a fresh process comes up on the same data directory);
+    5. startup recovery finishes op-old's reverse rollback;
+    6. the previously blocked request now submits and completes, with the
+       device action log consistent.
+    """
+    monkeypatch.setenv("VALVE_DB_DIR", str(tmp_path / "appdb"))
+    from app.main import RESTART_EXIT_CODE
+
+    port = _free_port()
+    old = _payload("op-old")
+    blocked = {
+        "operation_id": "op-new",
+        "valves": [
+            {"valve_id": "V01", "initial_opening": 51, "target_opening": 71},
+            {"valve_id": "V02", "initial_opening": 52, "target_opening": 72},
+        ],
+    }
+    free = {
+        "operation_id": "op-free",
+        "valves": [
+            {"valve_id": "V07", "initial_opening": 7, "target_opening": 57},
+            {"valve_id": "V08", "initial_opening": 8, "target_opening": 58},
+        ],
+    }
+
+    # ---- first process: stuck old op, blocked overlap, disjoint ok, restart
+    with server(tmp_path, port) as proc:
+        with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=5) as api:
+            api.post("/api/test/failures",
+                     json={"forward": ["V03"], "compensate": ["V02"]})
+            s = api.post("/api/switches", json=old).json()
+            assert s["phase"] == "COMPENSATION_FAILED"
+
+            r = api.post("/api/switches", json=blocked)
+            assert r.status_code == 409
+            assert "op-old" in r.json()["detail"]
+            # No record, no device movement, no executed action for op-new.
+            assert api.get("/api/switches/op-new").status_code == 404
+            assert api.get("/api/devices/executed-actions",
+                           params={"operation_id": "op-new"}).json() == []
+            cur = {v["valve_id"]: v["opening"]
+                   for v in api.get("/api/devices/valves").json()}
+            assert cur["V01"] == 51 and cur["V02"] == 52
+
+            r = api.post("/api/switches", json=free)
+            assert r.status_code == 201 and r.json()["phase"] == "COMPLETED"
+
+            # Fault cleared BEFORE the restart (persists in the device db).
+            api.post("/api/test/failures",
+                     json={"forward": [], "compensate": []})
+            try:
+                r = api.post("/api/test/restart")
+                assert r.status_code == 200
+            except httpx.HTTPError:
+                pass  # response lost to the hard exit; the restart still counts
+        assert _wait_dead(proc) == RESTART_EXIT_CODE
+
+    # ---- second process: startup recovery settles op-old, op-new unblocks
+    with server(tmp_path, port) as _:
+        with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=5) as api:
+            s0 = api.get("/api/switches/op-old").json()
+            assert s0["phase"] == "COMPENSATED"
+            cur = {v["valve_id"]: v["opening"]
+                   for v in api.get("/api/devices/valves").json()}
+            assert cur["V01"] == 1 and cur["V02"] == 2
+
+            r = api.post("/api/switches", json=blocked)
+            assert r.status_code == 201
+            s = r.json()
+            assert s["phase"] == "COMPLETED"
+            assert [v["current_opening"] for v in s["valves"]] == [71, 72]
+
+            acts = api.get("/api/devices/executed-actions",
+                           params={"operation_id": "op-new"}).json()
+            assert [(a["valve_id"], a["phase"], a["opening"]) for a in acts] == [
+                ("V01", "FORWARD", 71), ("V02", "FORWARD", 72)
+            ]
+            acts_old = api.get("/api/devices/executed-actions",
+                               params={"operation_id": "op-old"}).json()
+            comp = [(a["valve_id"], a["opening"])
+                    for a in acts_old if a["phase"] == "COMPENSATE"]
+            assert comp == [("V02", 2), ("V01", 1)]  # reverse order, once each

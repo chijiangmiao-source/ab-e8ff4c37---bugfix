@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -13,8 +14,11 @@ from pydantic import BaseModel
 
 from .device import DeviceBank
 from .models import SwitchRequest, SwitchStatus
-from .saga import PayloadConflict, SagaEngine
+from .saga import PayloadConflict, SagaEngine, ValveConflict
 from .store import SwitchStore
+
+# Exit code used by the test-only restart hook; distinctive in process logs.
+RESTART_EXIT_CODE = 75
 
 
 class FailureConfig(BaseModel):
@@ -64,6 +68,14 @@ def submit_switch(req: SwitchRequest) -> Response:
             detail=(
                 f"operation_id {req.operation_id!r} already exists with a "
                 "different payload; no device was touched"
+            ),
+        )
+    except ValveConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"operation_id {req.operation_id!r} rejected: {exc}; resume "
+                "the unfinished operation first; no device was touched"
             ),
         )
     return JSONResponse(
@@ -128,6 +140,20 @@ def test_failures(cfg: FailureConfig) -> FailureConfig:
         raise HTTPException(status_code=403, detail="reset disabled")
     devices.set_failures(cfg.forward, cfg.compensate)
     return cfg
+
+
+@app.post("/api/test/restart")
+def test_restart() -> dict:
+    """Hard-restart the service process (test support only).
+
+    The process exits moments after replying; the orchestrator's restart
+    policy (Compose ``restart: unless-stopped``) brings it back against the
+    same data directory, exercising startup recovery over HTTP.
+    """
+    if os.environ.get("VALVE_ALLOW_RESET", "0") != "1":
+        raise HTTPException(status_code=403, detail="reset disabled")
+    threading.Timer(0.5, os._exit, args=(RESTART_EXIT_CODE,)).start()
+    return {"status": "restarting", "exit_code": RESTART_EXIT_CODE}
 
 
 # ----------------------------------------------------------------- static UI

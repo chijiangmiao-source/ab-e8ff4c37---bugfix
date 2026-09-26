@@ -8,6 +8,7 @@
 - **崩溃回执对账**：进程恰在“设备已变更、应用回执未落库”时中断（`os._exit(77)`），重启后凭设备去重记录辨认该动作，**不会重复改变开度**。
 - **逆序补偿**：任一台阀前向失败（拒绝/网络失败）后，已成功变更的阀门按成功顺序的**相反顺序**恢复原开度；全部恢复成功才报告 `COMPENSATED`。
 - **补偿失败可续**：补偿也失败时停留在 `COMPENSATION_FAILED`，逐阀状态明确可继续恢复（`resume` 或同标识重提），已恢复的阀不会再次动作。
+- **未完成操作保护阀门**：操作在到达终态（`COMPLETED`/`COMPENSATED`）前持续拥有其涉及的阀门；任何包含共享阀门的新操作标识提交都会得到 `409` 冲突且**不触碰任何设备、不留记录**，不含共享阀门的切换不受影响。旧操作恢复完成后，此前被阻塞的请求即可正常提交并完成。
 - **阶段明确**：`PENDING / EXECUTING / COMPLETED / COMPENSATING / COMPENSATED / COMPENSATION_FAILED`，任何中断点都不会留下“未说明的半切换状态”。
 
 ## 运行（Docker Compose）
@@ -40,14 +41,14 @@ WEB_URL=http://127.0.0.1:8080 .venv/bin/python scripts/verify.py
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/api/switches` | 提交多阀切换（2–8 阀，开度 0–100 整数） |
+| POST | `/api/switches` | 提交多阀切换（2–8 阀，开度 0–100 整数）；与未完成操作共享阀门时返回 `409` |
 | GET | `/api/switches/{operation_id}` | 查询服务端确认的阶段与每阀最终开度 |
 | POST | `/api/switches/{operation_id}/resume` | 继续未完成的切换/补偿 |
 | GET | `/api/devices/executed-actions?operation_id=` | 查询设备已执行动作（去重日志） |
 | GET | `/api/devices/valves` | 模拟设备当前开度 |
 | GET | `/health` | 健康检查 |
 
-`POST /api/test/reset` 与 `POST /api/test/failures` 为测试钩子，仅在 `VALVE_ALLOW_RESET=1` 时可用，可注入某阀的 FORWARD 拒绝或 COMPENSATE 网络失败。
+`POST /api/test/reset`、`POST /api/test/failures` 与 `POST /api/test/restart` 为测试钩子，仅在 `VALVE_ALLOW_RESET=1` 时可用：可注入某阀的 FORWARD 拒绝或 COMPENSATE 网络失败，或让进程硬退出（依赖编排层的重启策略拉起，用于覆盖“故障排除并重启”链路）。
 
 ## 阶段语义
 
@@ -63,6 +64,8 @@ PENDING ──> EXECUTING ──> COMPLETED
 
 ## 测试
 
-- `tests/test_saga.py`：逆序补偿顺序、幂等重放、载荷冲突、补偿失败续恢复、设备先提交/回执后丢失的对账。
-- `tests/test_http.py`：HTTP 生命周期、409 不触设备、校验（422）。
-- `tests/test_restart_process.py`：**真实 uvicorn 子进程**在设备提交后、回执前硬退出，新进程重启后辨认动作且不重复改变开度；补偿中断后续补仍为逆序。
+- `tests/test_saga.py`：逆序补偿顺序、幂等重放、载荷冲突、补偿失败续恢复、设备先提交/回执后丢失的对账，以及未完成操作对共享阀门的保护（冲突不触设备、跨重启仍生效、旧操作恢复后放行）。
+- `tests/test_http.py`：HTTP 生命周期、409 不触设备（异载荷冲突与共享阀门冲突）、校验（422）。
+- `tests/test_restart_process.py`：**真实 uvicorn 子进程**在设备提交后、回执前硬退出，新进程重启后辨认动作且不重复改变开度；补偿中断后续补仍为逆序；补偿失败→共享阀门 409→故障排除并重启→旧操作恢复→被阻塞请求完成的完整链路。
+- `scripts/smoke.py`：针对运行中服务的 HTTP 冒烟（含上述保护链路，不含重启）。
+- `scripts/restart_chain.py`：针对可重启的 Compose 服务，经 `/api/test/restart` 钩子覆盖含真实重启的完整链路；`verify` 服务在 `WEB_RESTARTABLE=1`（Compose 已配置）时自动执行。

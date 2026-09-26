@@ -7,6 +7,9 @@ Verifies against a running server:
   3. idempotent replay returns the same result
   4. same operation_id with a changed payload -> 409, devices untouched
   5. executed-action query endpoint
+  6. unfinished compensation protects its valves: a new operation_id over
+     shared valves -> 409 with no device movement; disjoint valves still
+     switch; after the old operation restores, the blocked request completes
 
 Exits 0 on success, 1 on any failure.
 """
@@ -97,6 +100,72 @@ def main(base_url: str) -> int:
         fw = [(a["valve_id"], a["phase"]) for a in r4.json()]
         check("executed-actions queryable",
               r4.status_code == 200 and len(fw) == 4, str(fw))
+
+        # ---- unfinished compensation protects its valves
+        check("reset for protection chain",
+              api.post("/api/test/reset").status_code == 200)
+        check("inject forward+compensate failures",
+              api.post("/api/test/failures",
+                       json={"forward": ["V03"],
+                             "compensate": ["V02"]}).status_code == 200)
+        r = api.post("/api/switches", json=payload("smoke-stuck"))
+        check("stuck switch -> 201", r.status_code == 201, r.text)
+        check("old switch COMPENSATION_FAILED",
+              r.json()["phase"] == "COMPENSATION_FAILED", r.json()["phase"])
+
+        blocked = {
+            "operation_id": "smoke-blocked",
+            "valves": [
+                {"valve_id": "V01", "initial_opening": 51,
+                 "target_opening": 71},
+                {"valve_id": "V02", "initial_opening": 52,
+                 "target_opening": 72},
+            ],
+        }
+        r = api.post("/api/switches", json=blocked)
+        check("shared-valve switch -> 409 conflict",
+              r.status_code == 409, f"{r.status_code} {r.text}")
+        check("conflict names the unfinished operation",
+              "smoke-stuck" in r.json().get("detail", ""), r.text)
+        cur = {v["valve_id"]: v["opening"]
+               for v in api.get("/api/devices/valves").json()}
+        check("conflict did not change field openings",
+              cur.get("V01") == 51 and cur.get("V02") == 52, str(cur))
+        check("blocked operation left no record",
+              api.get("/api/switches/smoke-blocked").status_code == 404)
+        check("no device actions logged for blocked operation",
+              api.get("/api/devices/executed-actions",
+                      params={"operation_id": "smoke-blocked"}).json() == [])
+
+        disjoint = {
+            "operation_id": "smoke-free",
+            "valves": [
+                {"valve_id": "V07", "initial_opening": 7,
+                 "target_opening": 57},
+                {"valve_id": "V08", "initial_opening": 8,
+                 "target_opening": 58},
+            ],
+        }
+        r = api.post("/api/switches", json=disjoint)
+        check("disjoint switch still completes",
+              r.status_code == 201 and r.json()["phase"] == "COMPLETED",
+              f"{r.status_code} {r.text}")
+
+        # Fault cleared; old operation restores; blocked request now goes.
+        check("clear failures",
+              api.post("/api/test/failures",
+                       json={"forward": [],
+                             "compensate": []}).status_code == 200)
+        r = api.post("/api/switches/smoke-stuck/resume")
+        check("old switch resumed to COMPENSATED",
+              r.json()["phase"] == "COMPENSATED", r.text)
+        r = api.post("/api/switches", json=blocked)
+        check("previously blocked switch now completes",
+              r.status_code == 201 and r.json()["phase"] == "COMPLETED",
+              f"{r.status_code} {r.text}")
+        check("previously blocked switch reached its targets",
+              [v["current_opening"] for v in r.json()["valves"]] == [71, 72],
+              r.text)
 
     print("HTTP smoke: ALL CHECKS PASSED")
     return 0

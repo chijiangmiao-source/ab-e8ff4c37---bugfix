@@ -6,6 +6,9 @@ Runs, in order:
   2. code tests         - pytest (reverse-order compensation and
                           post-restart receipt recognition included)
   3. HTTP smoke         - live checks against the ``web`` service
+  4. restart chain      - compensation-failure protection across a real
+                          service restart (only when WEB_RESTARTABLE=1,
+                          i.e. the web container has a restart policy)
 
 The process exits non-zero (and reports the code) as soon as any stage
 fails; exits 0 only when every stage passes.
@@ -80,6 +83,17 @@ def main() -> int:
     rc = run("HTTP smoke", [sys.executable, "scripts/smoke.py", WEB_URL])
     if rc:
         return rc
+
+    # 4. restart-chain acceptance (needs a restartable web service) ----------
+    if os.environ.get("WEB_RESTARTABLE", "0") == "1":
+        rc = run("HTTP restart chain (compensation failure -> 409 -> "
+                 "restart -> recovery -> submit)",
+                 [sys.executable, "scripts/restart_chain.py", WEB_URL])
+        if rc:
+            return rc
+    else:
+        print("--- WEB_RESTARTABLE!=1: skipping restart-chain acceptance",
+              flush=True)
 
     print("\n=== VERIFY OK: build + tests + HTTP smoke all passed ===",
           flush=True)

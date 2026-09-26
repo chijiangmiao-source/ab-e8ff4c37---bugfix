@@ -33,6 +33,10 @@ services:
     environment:
       WEB_URL: "http://web:${PORT:-8080}"
       VALVE_ALLOW_RESET: "1"
+      # The web service carries a restart policy, so the verify run also
+      # exercises the compensation-failure -> 409 -> restart -> recovery
+      # chain over HTTP (scripts/restart_chain.py).
+      WEB_RESTARTABLE: "1"
     depends_on:
       web:
         condition: service_healthy
