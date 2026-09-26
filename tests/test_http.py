@@ -116,5 +116,67 @@ def test_validation_rejects_bad_count_and_opening(client):
     assert c.post("/api/switches", json=bad_opening).status_code == 422
 
 
+def test_shared_valve_switch_conflicts_until_compensation_finishes(client):
+    c, _ = client
+    # Old switch: V03 rejects FORWARD, V02's compensation hits a network
+    # failure -> COMPENSATION_FAILED with V01/V02 still at their targets.
+    c.post("/api/test/failures",
+           json={"forward": ["V03"], "compensate": ["V02"]})
+    old = c.post("/api/switches", json=payload("op-old")).json()
+    assert old["phase"] == "COMPENSATION_FAILED"
+
+    # A switch on unshared valves is not affected.
+    other = {
+        "operation_id": "op-unshared",
+        "valves": [
+            {"valve_id": "V07", "initial_opening": 7, "target_opening": 77},
+            {"valve_id": "V08", "initial_opening": 8, "target_opening": 88},
+        ],
+    }
+    r = c.post("/api/switches", json=other)
+    assert r.status_code == 201 and r.json()["phase"] == "COMPLETED"
+
+    # New operation id on the still-owned valves -> explicit 409 conflict.
+    follow_up = {
+        "operation_id": "op-new",
+        "valves": [
+            {"valve_id": "V01", "initial_opening": 51, "target_opening": 20},
+            {"valve_id": "V02", "initial_opening": 52, "target_opening": 30},
+        ],
+    }
+    r = c.post("/api/switches", json=follow_up)
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail["error"] == "valve_conflict"
+    assert detail["conflicts"] == [
+        {"operation_id": "op-old", "valves": ["V01", "V02"]}
+    ]
+
+    # The conflicting request touched nothing: field openings unchanged,
+    # no device actions and no stored intent for op-new.
+    cur = {v["valve_id"]: v["opening"]
+           for v in c.get("/api/devices/valves").json()}
+    assert cur["V01"] == 51 and cur["V02"] == 52
+    assert c.get("/api/devices/executed-actions",
+                 params={"operation_id": "op-new"}).json() == []
+    assert c.get("/api/switches/op-new").status_code == 404
+
+    # Fault cleared; the old switch finishes its rollback ...
+    c.post("/api/test/failures", json={"forward": ["V03"], "compensate": []})
+    s = c.post("/api/switches/op-old/resume").json()
+    assert s["phase"] == "COMPENSATED"
+    assert [v["current_opening"] for v in s["valves"]] == [1, 2, 3, 4]
+
+    # ... and the previously blocked switch now submits and completes.
+    r = c.post("/api/switches", json=follow_up)
+    assert r.status_code == 201, r.text
+    s = r.json()
+    assert s["phase"] == "COMPLETED"
+    assert [v["current_opening"] for v in s["valves"]] == [20, 30]
+    cur = {v["valve_id"]: v["opening"]
+           for v in c.get("/api/devices/valves").json()}
+    assert cur["V01"] == 20 and cur["V02"] == 30
+
+
 def v2valves(s):
     return s["valves"]

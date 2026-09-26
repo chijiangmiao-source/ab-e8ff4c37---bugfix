@@ -13,7 +13,7 @@ from pydantic import BaseModel
 
 from .device import DeviceBank
 from .models import SwitchRequest, SwitchStatus
-from .saga import PayloadConflict, SagaEngine
+from .saga import PayloadConflict, SagaEngine, ValveConflict
 from .store import SwitchStore
 
 
@@ -65,6 +65,21 @@ def submit_switch(req: SwitchRequest) -> Response:
                 f"operation_id {req.operation_id!r} already exists with a "
                 "different payload; no device was touched"
             ),
+        )
+    except ValveConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "valve_conflict",
+                "message": (
+                    "valve(s) still owned by an unfinished switch; no "
+                    "device was touched"
+                ),
+                "conflicts": [
+                    {"operation_id": op, "valves": valves}
+                    for op, valves in exc.conflicts.items()
+                ],
+            },
         )
     return JSONResponse(
         status_code=201 if created else 200,

@@ -16,6 +16,14 @@ Rules implemented here:
 * Re-submitting an existing operation_id returns the same stored result; a
   re-submission with a different payload is rejected (409) and never touches
   a device.
+* An unfinished switch protects the valves it still owes work on: while any
+  of its valves is changed-but-not-restored, a NEW operation_id naming one
+  of those valves is rejected with an explicit conflict (409) and never
+  touches a device.  Only once the older switch is fully settled
+  (COMPLETED / COMPENSATED) may a later switch take those valves over.
+  Without this guard a later switch could report COMPLETED on valves that
+  the older switch's compensation later silently restores to the original
+  openings.
 """
 from __future__ import annotations
 
@@ -33,6 +41,23 @@ FINAL_PHASES = {"COMPLETED", "COMPENSATED"}
 
 class PayloadConflict(Exception):
     """Same operation_id, different payload."""
+
+
+class ValveConflict(Exception):
+    """A new switch names valves still owned by an unfinished switch.
+
+    ``conflicts`` maps each blocking operation_id to the sorted list of
+    shared valve ids.
+    """
+
+    def __init__(self, conflicts: Dict[str, List[str]]) -> None:
+        self.conflicts = conflicts
+        detail = "; ".join(
+            f"{op} holds {', '.join(valves)}" for op, valves in conflicts.items()
+        )
+        super().__init__(
+            f"valves still owned by unfinished switch(es): {detail}"
+        )
 
 
 class SagaEngine:
@@ -53,6 +78,13 @@ class SagaEngine:
                     raise PayloadConflict(req.operation_id)
                 # Same intent: run recovery/settlement, then return same result.
                 return self._resume_and_build(existing), False
+
+            conflicts = self._valve_conflicts(req)
+            if conflicts:
+                # Rejected BEFORE the intent is registered and BEFORE any
+                # device call: the protected valves stay exactly as the
+                # unfinished switch left them.
+                raise ValveConflict(conflicts)
 
             actions = [
                 ActionRecord(
@@ -100,6 +132,38 @@ class SagaEngine:
                     continue
                 recovered.append(self._resume_and_build(rec))
         return recovered
+
+    def protected_valves(self) -> Dict[str, List[str]]:
+        """Valves currently owned by unfinished switches.
+
+        A valve is protected while its switch is not in a final phase and
+        the valve was successfully moved forward but not yet restored —
+        i.e. the switch still owes that valve a compensation.  Maps each
+        blocking operation_id to its sorted protected valve ids.
+        """
+        protected: Dict[str, List[str]] = {}
+        with self._store.lock:
+            for rec in self._store.all():
+                if rec.phase in FINAL_PHASES:
+                    continue
+                owed = sorted(
+                    a.valve_id
+                    for a in rec.actions
+                    if a.forward_status == "SUCCESS"
+                    and a.compensate_status != "SUCCESS"
+                )
+                if owed:
+                    protected[rec.operation_id] = owed
+        return protected
+
+    def _valve_conflicts(self, req: SwitchRequest) -> Dict[str, List[str]]:
+        """Subset of protected_valves() that ``req`` would collide with."""
+        requested = {v.valve_id for v in req.valves}
+        return {
+            op: [v for v in valves if v in requested]
+            for op, valves in self.protected_valves().items()
+            if requested.intersection(valves)
+        }
 
     # ------------------------------------------------------------- machinery
 

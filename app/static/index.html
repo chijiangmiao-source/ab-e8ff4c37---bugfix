@@ -242,8 +242,18 @@ async function submit() {
     });
     const data = await r.json();
     if (!r.ok) {
-      showMsg($("formMsg"), "errbox",
-        `HTTP ${r.status}：${data.detail ? JSON.stringify(data.detail) : JSON.stringify(data)}`);
+      let msg;
+      if (r.status === 409 && data.detail &&
+          typeof data.detail === "object" &&
+          data.detail.error === "valve_conflict") {
+        const lines = (data.detail.conflicts || []).map(c =>
+          `操作 ${c.operation_id} 仍持有阀门：${c.valves.join("、")}`);
+        msg = "阀门冲突（未触碰任何设备）：\n" + lines.join("\n") +
+          "\n请等待旧操作全部恢复（COMPENSATED）后再提交本切换。";
+      } else {
+        msg = `HTTP ${r.status}：${data.detail ? JSON.stringify(data.detail) : JSON.stringify(data)}`;
+      }
+      showMsg($("formMsg"), "errbox", msg);
     } else {
       showMsg($("formMsg"), "okbox",
         r.status === 201 ? "切换意图已持久化，服务端返回执行结果。"

@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 
 from app.models import SwitchRequest, ValveSpec
-from app.saga import PayloadConflict
+from app.saga import PayloadConflict, ValveConflict
 
 from conftest import make_request
 
@@ -176,3 +176,114 @@ def test_valve_count_bounds(engine, n):
     eng, _, _, _ = engine
     with pytest.raises(ValueError):
         eng.submit(make_request("op-bounds", n=n))
+
+
+def _compensation_failed_switch(engine, op="op-guard"):
+    """Drive a switch into COMPENSATION_FAILED with V01/V02 still at their
+    targets (V03 rejected forward, V02's restore hit a network failure)."""
+    eng, store, devices, _ = engine
+    devices.set_failures(forward=["V03"], compensate=["V02"])
+    status = eng.submit(make_request(op, n=4))[0]
+    assert status.phase == "COMPENSATION_FAILED"
+    return eng, store, devices
+
+
+def test_unfinished_compensation_blocks_shared_valves_and_touches_nothing(engine):
+    eng, store, devices = _compensation_failed_switch(engine)
+    actions_before = devices.executed_actions()
+    openings_before = {v.valve_id: v.opening for v in devices.list_valves()}
+
+    # New operation id, current field openings registered, other targets.
+    follow_up = SwitchRequest(
+        operation_id="op-follow",
+        valves=[
+            ValveSpec(valve_id="V01", initial_opening=61, target_opening=20),
+            ValveSpec(valve_id="V02", initial_opening=62, target_opening=30),
+        ],
+    )
+    with pytest.raises(ValveConflict) as excinfo:
+        eng.submit(follow_up)
+
+    assert excinfo.value.conflicts == {"op-guard": ["V01", "V02"]}
+    # Nothing was registered and no device was touched.
+    assert store.get("op-follow") is None
+    assert devices.executed_actions() == actions_before
+    assert {v.valve_id: v.opening for v in devices.list_valves()} == openings_before
+
+
+def test_unfinished_compensation_still_allows_unshared_valves(engine):
+    eng, store, devices = _compensation_failed_switch(engine)
+
+    other = SwitchRequest(
+        operation_id="op-other",
+        valves=[
+            ValveSpec(valve_id="V07", initial_opening=7, target_opening=77),
+            ValveSpec(valve_id="V08", initial_opening=8, target_opening=88),
+        ],
+    )
+    status, created = eng.submit(other)
+    assert created and status.phase == "COMPLETED"
+    assert {v.valve_id: v.opening for v in devices.list_valves()
+            if v.valve_id in ("V07", "V08")} == {"V07": 77, "V08": 88}
+
+
+def test_valve_rejected_by_forward_is_not_protected(engine):
+    """V03 never moved (its FORWARD was rejected), so a new switch may take
+    it even while V01/V02 remain protected."""
+    eng, store, devices = _compensation_failed_switch(engine)
+
+    devices.set_failures(forward=[], compensate=["V02"])
+    req = SwitchRequest(
+        operation_id="op-v03",
+        valves=[
+            ValveSpec(valve_id="V03", initial_opening=3, target_opening=33),
+            ValveSpec(valve_id="V04", initial_opening=4, target_opening=44),
+        ],
+    )
+    status, _ = eng.submit(req)
+    assert status.phase == "COMPLETED"
+
+
+def test_blocked_switch_submits_once_compensation_finishes(engine):
+    eng, store, devices = _compensation_failed_switch(engine)
+    follow_up = SwitchRequest(
+        operation_id="op-follow",
+        valves=[
+            ValveSpec(valve_id="V01", initial_opening=61, target_opening=20),
+            ValveSpec(valve_id="V02", initial_opening=62, target_opening=30),
+        ],
+    )
+    with pytest.raises(ValveConflict):
+        eng.submit(follow_up)
+
+    # Fault cleared; the old switch finishes its rollback ...
+    devices.set_failures(forward=["V03"], compensate=[])
+    assert eng.resume("op-guard").phase == "COMPENSATED"
+
+    # ... and now the previously blocked switch is accepted and completes.
+    status, created = eng.submit(follow_up)
+    assert created and status.phase == "COMPLETED"
+    assert {v.valve_id: v.current_opening for v in status.valves} == {
+        "V01": 20, "V02": 30,
+    }
+    cur = {v.valve_id: v.opening for v in devices.list_valves()}
+    assert cur["V01"] == 20 and cur["V02"] == 30
+
+
+def test_valve_protection_survives_engine_restart(engine):
+    eng, store, devices = _compensation_failed_switch(engine)
+
+    # Fresh engine over the same durable stores == service restart.
+    restarted = type(eng)(store, devices)
+    assert restarted.protected_valves() == {"op-guard": ["V01", "V02"]}
+
+    follow_up = SwitchRequest(
+        operation_id="op-follow",
+        valves=[
+            ValveSpec(valve_id="V01", initial_opening=61, target_opening=20),
+            ValveSpec(valve_id="V02", initial_opening=62, target_opening=30),
+        ],
+    )
+    with pytest.raises(ValveConflict):
+        restarted.submit(follow_up)
+    assert store.get("op-follow") is None
